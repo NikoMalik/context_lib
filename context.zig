@@ -3,10 +3,13 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Atomic = std.atomic.Value;
+const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 
 const epoll = switch (builtin.os.tag) {
     .linux => std.posix.fd_t,
     // .windows => std.iocp
+    //.macos => kqueue
 };
 
 pub const EVENT = linux.epoll_event;
@@ -56,28 +59,39 @@ pub const Hour = 60 * Second;
 //     BOOTTIME = 7,
 //     REALTIME_ALARM = 8,
 //     BOOTTIME_ALARM = 9,
-
+//=============================================================//
+//TODO: PROTECT FROM RACE DATA,ADD MUTEXES,MAKE MOR FREANDLY API
+//=============================================================//
 pub const Context = struct {
+    // CONTEXT 0 IS MAIN
+    // OTHER CONTEXTS IS CHILD
+    id: usize,
+    allocator: Allocator,
     epfd: posix.fd_t,
     cancelFd: posix.fd_t,
     cancelled: Atomic(bool),
+    is_deinited: Atomic(bool) = Atomic(bool).init(false),
     timerfd: ?posix.fd_t,
     deadline: ?u64,
-
+    parent: ?*Context,
+    children: std.ArrayList(*Context),
+    values: ?std.StringHashMapUnmanaged(?*anyopaque) = null,
     const Self = @This();
 
-    pub fn init() !Self {
+    pub fn init(
+        allocator: Allocator,
+    ) !Self {
         const epfd = try posix.epoll_create1(0);
-        errdefer posix.close(epfd);
+        errdefer posix.close(epfd); // check err
 
         const cancel_fd = try posix.eventfd(0, linux.EFD.NONBLOCK);
 
-        errdefer posix.close(cancel_fd);
+        errdefer posix.close(cancel_fd); // check err
 
         const timer_fd = linux.timerfd_create(linux.timerfd_clockid_t.MONOTONIC, linux.TFD{
             .NONBLOCK = true,
         });
-        errdefer posix.close(timer_fd);
+        errdefer posix.close(timer_fd); // check err
 
         var event = linux.epoll_event{
             .events = linux.EPOLL.IN | linux.EPOLL.ET,
@@ -89,33 +103,90 @@ pub const Context = struct {
         _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, @intCast(timer_fd), &event);
 
         return Self{
+            .id = 0,
+            .allocator = allocator,
+            .parent = null,
             .epfd = epfd,
             .cancelFd = cancel_fd,
             .timerfd = @intCast(timer_fd),
             .deadline = null,
-
             .cancelled = Atomic(bool).init(false),
+            .children = std.ArrayList(*Context).init(allocator),
+            .values = std.StringHashMapUnmanaged(?*anyopaque){},
         };
     }
 
-    pub fn deinit(self: *Self) void {
-        posix.close(self.epfd);
-        posix.close(self.cancelFd);
-        posix.close(self.timerfd.?);
+    pub fn withCancel(
+        parent: *Self,
+    ) !*Self {
+        const allocator = parent.allocator;
+        var child = try allocator.create(Self);
+        child.* = try Context.init(allocator);
+        child.parent = parent;
+        try parent.children.append(child);
+        child.id = 1 + child.id;
+
+        return child;
     }
 
-    pub fn cancel(self: *Self) void {
+    pub fn deinit(
+        self: *Self,
+    ) void {
+        if (self.is_deinited.load(.acquire)) return;
+        self.is_deinited.store(true, .release);
+
+        if (self.parent == null) { // if parent == null
+            for (self.children.items) |child| { // cleanup children
+                child.deinit();
+                self.allocator.destroy(child);
+            }
+            self.children.deinit();
+            if (self.values) |*vals| {
+                vals.deinit(self.allocator);
+                self.values = null;
+            }
+            posix.close(self.epfd);
+            posix.close(self.cancelFd);
+            if (self.timerfd) |fd| posix.close(fd);
+            std.debug.print("succeded clean: context{d}\n", .{self.id});
+
+            return;
+        }
+
+        if (self.values) |*vals| {
+            vals.deinit(self.allocator);
+            self.values = null;
+        }
+
+        posix.close(self.epfd);
+        posix.close(self.cancelFd);
+        if (self.timerfd) |fd| posix.close(fd);
+
+        std.debug.print("succeded clean: context{d}\n", .{self.id});
+    }
+    pub fn cancel(
+        self: *Self,
+    ) void {
         if (!self.cancelled.swap(true, .seq_cst)) {
             const val: u64 = 1;
             _ = posix.write(self.cancelFd, std.mem.asBytes(&val)) catch {};
+            for (self.children.items) |child| {
+                child.cancel();
+            }
         }
     }
 
-    pub inline fn isCancelled(self: *Self) bool {
+    pub inline fn isCancelled(
+        self: *Self,
+    ) bool {
         return self.cancelled.load(.acquire);
     }
 
-    pub fn setDeadline(self: *Self, timeout_ns: u64) !void {
+    pub fn setDeadline(
+        self: *Self,
+        timeout_ns: u64,
+    ) !void {
+        if (self.timerfd == null) return error.TimerNotInitialized;
         const ts = linux.timespec{
             .sec = @intCast(timeout_ns / 1_000_000_000),
             .nsec = @intCast(timeout_ns % 1_000_000_000),
@@ -128,16 +199,49 @@ pub const Context = struct {
         };
 
         _ = linux.timerfd_settime(self.timerfd.?, linux.TFD.TIMER{}, &spec, null);
+        self.deadline = timeout_ns;
     }
 
-    pub fn wait(self: *Self, events: []linux.epoll_event) !usize {
+    pub fn setValue(
+        self: *Self,
+        key: []const u8,
+        value: ?*anyopaque,
+    ) !void {
+        if (self.values == null) {
+            self.values = std.StringHashMapUnmanaged(?*anyopaque){};
+        }
+        std.debug.print("Hash table size before put: {}\n", .{self.values.?.count()});
+        try self.values.?.put(self.allocator, key, value);
+        std.debug.print("Hash table size after put: {}\n", .{self.values.?.count()});
+    }
+    pub fn getValue(
+        self: *Self,
+        key: []const u8,
+    ) ?*anyopaque {
+        if (self.values) |values| {
+            if (values.get(key)) |value| {
+                return value;
+            }
+        }
+        if (self.parent) |parent| {
+            return parent.getValue(key);
+        }
+        return null;
+    }
+    pub fn wait(
+        self: *Self,
+        events: []linux.epoll_event,
+    ) !usize {
         const count = linux.epoll_wait(
             self.epfd,
             events.ptr,
             @intCast(events.len),
             -1,
         );
-
+        if (count < 0) {
+            std.log.err("epoll_wait failed with errno: {}", .{posix.errno(-count)});
+            return error.EpollWaitFailed;
+        }
         for (events[0..count]) |*ev| {
             const fd = ev.data.fd;
             if (fd == self.cancelFd) {
@@ -154,42 +258,88 @@ pub const Context = struct {
 
         return count;
     }
+
+    fn eventLoop(
+        self: *Self,
+    ) !void {
+        var events: [64]linux.epoll_event = undefined;
+
+        while (!self.isCancelled()) {
+            // eventLoop
+            _ = try self.wait(&events);
+        }
+    }
 };
 test "context deadline with timerfd" {
-    var ctx = try Context.init();
-    defer ctx.deinit();
-
-    try ctx.setDeadline(100 * std.time.ns_per_ms);
-
+    var db = std.heap.DebugAllocator(.{}){};
+    defer _ = db.deinit();
+    const allocator = db.allocator();
     const start = std.time.nanoTimestamp();
-    var events: [EVENT_SIZE]EVENT = undefined;
-
-    _ = try ctx.wait(&events);
-    std.debug.print("in\n", .{});
+    //==========================================//
+    var ctx = try Context.init(allocator);
+    defer ctx.deinit();
+    try ctx.setDeadline(100 * Millisecond);
+    try ctx.eventLoop();
+    //===========================================//
 
     const duration = @divTrunc((std.time.nanoTimestamp() - start), std.time.ns_per_ms);
 
-    std.debug.print("make some changes\n", .{});
+    std.debug.print("make some changes\n duration: {d}\n", .{duration});
+    assert(duration > 0);
+
     try std.testing.expect(duration >= 90);
     try std.testing.expect(ctx.isCancelled());
 }
 
 test "context cancellation" {
-    var ctx = try Context.init();
-    defer ctx.deinit();
+    var db = std.heap.DebugAllocator(.{}){};
+    defer _ = db.deinit();
+    const allocator = db.allocator();
 
+    var ctx = try Context.init(allocator);
+    defer ctx.deinit();
     try ctx.setDeadline(100 * Millisecond);
-    var events: [2]linux.epoll_event = undefined;
-    _ = try ctx.wait(&events);
+    try ctx.eventLoop();
+
+    try long_running_task(&ctx);
 
     const thread = try std.Thread.spawn(.{}, long_running_task, .{&ctx});
     defer thread.join();
 
     // std.time.sleep(50 * std.time.ns_per_ms);
-    ctx.cancel();
+    // ctx.cancel();
 
     try std.testing.expect(ctx.isCancelled());
 }
+
+test "parent and child " {
+    var db = std.heap.DebugAllocator(.{}){};
+    defer _ = db.deinit();
+    const allocator = db.allocator();
+
+    // PARENT context
+    var parent = try Context.init(allocator);
+    defer parent.deinit();
+    // try parent.eventLoop();
+
+    // CHILD context
+    var child = try Context.withCancel(&parent);
+    defer child.deinit();
+
+    try child.setDeadline(100_000_000); // 100ms
+
+    // SET OUR VALUE
+    var value = "request_id_123";
+
+    try child.setValue("request_id", @ptrCast(&value));
+
+    const get_value = child.getValue("request_id");
+    std.debug.print("value: {s}\n", .{@as(*[]const u8, @ptrCast(@alignCast(get_value))).*});
+    try child.eventLoop();
+
+    std.time.sleep(200_000_000); // 200ms
+}
+
 fn long_running_task(ctx: *Context) !void {
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
