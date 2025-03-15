@@ -60,10 +60,16 @@ pub const Hour = 60 * Second;
 //     REALTIME_ALARM = 8,
 //     BOOTTIME_ALARM = 9,
 //=============================================================//
-//TODO: PROTECT FROM RACE DATA,ADD MUTEXES,MAKE MOR FREANDLY API
+//TODO: PROTECT FROM RACE DATA,ADD MUTEXES[x],MAKE MOR FREANDLY API[], ASYNC[]
 //=============================================================//
+const Value = struct {
+    ptr: *anyopaque, // where we store our value
+    allocator: Allocator, // snap allocator that we can delete this shit
+    freeFn: *const fn (Allocator, *anyopaque) void,
+};
+
 pub const Context = struct {
-    // CONTEXT 0 IS MAIN
+    // CONTEXT 1 IS PARENT
     // OTHER CONTEXTS IS CHILD
     id: usize,
     allocator: Allocator,
@@ -74,8 +80,9 @@ pub const Context = struct {
     timerfd: ?posix.fd_t,
     deadline: ?u64,
     parent: ?*Context,
+    mutex: std.Thread.Mutex = .{},
     children: std.ArrayList(*Context),
-    values: ?std.StringHashMap(?*anyopaque) = null,
+    values: ?std.StringHashMap(Value) = null,
     const Self = @This();
 
     pub fn init(
@@ -118,7 +125,7 @@ pub const Context = struct {
         }
 
         return Self{
-            .id = 0,
+            .id = 1,
             .allocator = allocator,
             .parent = null,
             .epfd = epfd,
@@ -127,20 +134,22 @@ pub const Context = struct {
             .deadline = null,
             .cancelled = Atomic(bool).init(false),
             .children = std.ArrayList(*Context).init(allocator),
-            .values = std.StringHashMap(?*anyopaque).init(allocator),
+            .values = std.StringHashMap(Value).init(allocator),
+            // .values = std.StringHashMap(?*anyopaque).init(allocator),
         };
     }
 
     pub fn withCancel(
         parent: *Self,
     ) !*Self {
+        parent.mutex.lock();
+        defer parent.mutex.unlock();
         const allocator = parent.allocator;
         var child = try allocator.create(Self);
         child.* = try Context.init(allocator);
         child.parent = parent;
         try parent.children.append(child);
-        child.id = 1 + child.id;
-
+        child.id = parent.children.items.len + 1; //  if 1 == 2 // if 2 == 3 and etc
         return child;
     }
 
@@ -149,11 +158,25 @@ pub const Context = struct {
     ) void {
         if (self.is_deinited.load(.acquire)) return;
         self.is_deinited.store(true, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        //============================================//
+        //how i get,keys automaticly clear after deinit
+        //============================================//
 
         if (self.parent == null) { // if parent == null
             for (self.children.items) |child| { // cleanup children
                 // child.values.?.deinit(self.allocator);
                 if (child.values) |*values| {
+                    var it = values.iterator();
+                    while (it.next()) |entry| {
+                        entry.value_ptr.freeFn(
+                            entry.value_ptr.allocator,
+                            entry.value_ptr.ptr,
+                        );
+                    }
+
                     values.deinit();
                 }
                 child.deinit();
@@ -162,6 +185,13 @@ pub const Context = struct {
             self.children.deinit();
 
             if (self.values) |*vals| {
+                var it = vals.iterator();
+                while (it.next()) |entry| {
+                    entry.value_ptr.freeFn(
+                        entry.value_ptr.allocator,
+                        entry.value_ptr.ptr,
+                    );
+                }
                 vals.deinit();
                 self.values = null;
             }
@@ -192,6 +222,11 @@ pub const Context = struct {
         if (!self.cancelled.swap(true, .seq_cst)) {
             const val: u64 = 1;
             _ = posix.write(self.cancelFd, std.mem.asBytes(&val)) catch {};
+            // if (self.parent == null) {
+            for (self.children.items) |child| {
+                child.cancel();
+            }
+            // }
             // for (self.children.items) |child| {
             //     child.cancel();
             // }
@@ -223,20 +258,38 @@ pub const Context = struct {
         _ = linux.timerfd_settime(self.timerfd.?, linux.TFD.TIMER{}, &spec, null);
         self.deadline = timeout_ns;
     }
-
+    //DECLARE TYPE FOR VALUE
     pub fn setValue(
         self: *Self,
+        comptime T: type,
         key: []const u8,
-        value: ?*anyopaque,
+        value: T,
     ) !void {
         if (self.values == null) {
-            self.values = std.StringHashMap(?*anyopaque).init(self.allocator);
+            self.values = std.StringHashMap(Value).init(self.allocator);
         }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const wrap = struct {
+            pub fn free(allocator: Allocator, ptr: *anyopaque) void {
+                const val: *T = @ptrCast(@alignCast(ptr));
+                allocator.destroy(val);
+            }
+        };
+
         if (self.values.?.contains(key)) {
             std.debug.print("Overwriting key '{s}' in context {d}\n", .{ key, self.id });
+            return;
         }
+        const boxed = try self.allocator.create(T);
+        boxed.* = value;
+
         std.debug.print("Hash table size before put: {}\n", .{self.values.?.count()});
-        try self.values.?.put(key, value);
+        try self.values.?.put(key, .{
+            .ptr = @ptrCast(boxed),
+            .allocator = self.allocator,
+            .freeFn = wrap.free,
+        });
         std.debug.print("Hash table size after put: {}\n", .{self.values.?.count()});
     }
     pub fn getValue(
@@ -258,9 +311,10 @@ pub const Context = struct {
         key: []const u8,
         visited: *std.AutoHashMap(*Context, void),
     ) ?*anyopaque {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         std.debug.print("Check Context: {d}, key: {s}\n", .{ self.id, key });
         if (visited.contains(self)) return null;
-        visited.put(self, {}) catch return null;
         visited.put(self, {}) catch |err| {
             std.log.err(" visited: {}", .{err});
             return null;
@@ -268,7 +322,7 @@ pub const Context = struct {
 
         if (self.values) |values| {
             if (values.get(key)) |val| {
-                return val;
+                return @ptrCast(@alignCast(val.ptr));
             }
         }
 
@@ -386,9 +440,9 @@ test "parent and child " {
     try child.setDeadline(100_000_000); // 100ms
 
     // SET OUR VALUE
-    var value = "request_id_123";
+    const value = "request_id_123";
 
-    try child.setValue("request_id", @ptrCast(&value));
+    try child.setValue([]const u8, "request_id", value);
 
     const get_value = child.getValue("request_id");
     std.debug.print("value: {s}\n", .{@as(*[]const u8, @ptrCast(@alignCast(get_value))).*});
@@ -408,8 +462,8 @@ test "value propagation" {
     var child = try Context.withCancel(&parent);
     defer child.deinit();
 
-    var test_value = "parent_value";
-    try parent.setValue("key", (@ptrCast(&test_value)));
+    const test_value = "parent_value";
+    try parent.setValue([]const u8, "key", test_value);
 
     const received = child.getValue("key");
 
@@ -423,7 +477,85 @@ test "value propagation" {
     }
     return;
 }
-//
+
+test "deadline cancellation" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    const start = std.time.milliTimestamp();
+    try ctx.setDeadline(100 * std.time.ns_per_ms); // 100 ms
+    try ctx.eventLoop();
+    const duration = std.time.milliTimestamp() - start;
+
+    try std.testing.expect(ctx.isCancelled());
+    try std.testing.expect(duration >= 100 and duration < 150);
+}
+
+test "manual cancellation" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    const thread = try std.Thread.spawn(.{}, long_running_task, .{&ctx});
+    std.time.sleep(50 * std.time.ns_per_ms); // imitate work
+    ctx.cancel();
+    thread.join();
+
+    try std.testing.expect(ctx.isCancelled());
+}
+
+test "multi-level inheritance" {
+    const allocator = std.testing.allocator;
+    var root = try Context.init(allocator);
+    defer root.deinit();
+
+    var child1 = try Context.withCancel(&root);
+    defer child1.deinit();
+
+    var child2 = try Context.withCancel(child1.parent.?);
+    defer child2.deinit();
+
+    try root.setValue([]const u8, "femboy", "root_value");
+
+    const root_value = @as(*[]const u8, @alignCast(@ptrCast(root.getValue("femboy")))).*;
+    const child1_value = @as(*[]const u8, @alignCast(@ptrCast(child1.getValue("femboy")))).*;
+    const child2_value = @as(*[]const u8, @alignCast(@ptrCast(child2.getValue("femboy")))).*;
+
+    try std.testing.expectEqualStrings("root_value", root_value);
+    try std.testing.expectEqualStrings("root_value", child1_value);
+    try std.testing.expectEqualStrings("root_value", child2_value);
+}
+test "cancel parent cancels child" {
+    const allocator = std.testing.allocator;
+
+    // Create parent context
+    var parent = try Context.init(allocator);
+    defer parent.deinit();
+
+    // Create child context
+    var child = try Context.withCancel(&parent);
+    defer child.deinit();
+
+    // Spawn a thread to run child's eventLoop
+
+    runEventLoop(child); //if not thread its blocked
+    // i should think about this....
+
+    // Cancel the parent
+    parent.cancel();
+
+    // Give the child thread a moment to process the cancellation
+    std.time.sleep(100 * std.time.ns_per_ms);
+
+    // Verify that the child is canceled
+    try std.testing.expect(child.isCancelled());
+}
+
+inline fn runEventLoop(ctx: *Context) void {
+    try ctx.eventLoop();
+}
+
 fn long_running_task(ctx: *Context) !void {
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
