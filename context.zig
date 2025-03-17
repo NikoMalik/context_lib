@@ -5,6 +5,7 @@ const posix = std.posix;
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
+const time = std.time;
 
 const epoll = switch (builtin.os.tag) {
     .linux => std.posix.fd_t,
@@ -60,13 +61,19 @@ pub const Hour = 60 * Second;
 //     REALTIME_ALARM = 8,
 //     BOOTTIME_ALARM = 9,
 //=============================================================//
-//TODO: PROTECT FROM RACE DATA,ADD MUTEXES[x],MAKE MOR FREANDLY API[], ASYNC[]
+//TODO: PROTECT FROM RACE DATA,ADD MUTEXES[x],MAKE MOR FREANDLY API[], ASYNC WITH COROUTINE FROM CORO[]
 //=============================================================//
 const Value = struct {
     ptr: *anyopaque, // where we store our value
     allocator: Allocator, // snap allocator that we can delete this shit
     freeFn: *const fn (Allocator, *anyopaque) void,
 };
+
+pub fn Block_fn(comptime T: type) type {
+    return struct {
+        run: *const fn () T,
+    };
+}
 
 pub const Context = struct {
     // CONTEXT 1 IS PARENT
@@ -83,6 +90,7 @@ pub const Context = struct {
     mutex: std.Thread.Mutex = .{},
     children: std.ArrayList(*Context),
     values: ?std.StringHashMap(Value) = null,
+    // Block_Task: Block_fn(comptime T: type)
     const Self = @This();
 
     pub fn init(
@@ -95,9 +103,13 @@ pub const Context = struct {
 
         errdefer posix.close(cancel_fd); // check err
 
-        const timer_fd = linux.timerfd_create(linux.timerfd_clockid_t.MONOTONIC, linux.TFD{
-            .NONBLOCK = true,
-        });
+        const timer_fd = linux.timerfd_create(
+            linux.timerfd_clockid_t.MONOTONIC,
+            linux.TFD{
+                .NONBLOCK = true,
+                .CLOEXEC = true,
+            },
+        );
         errdefer posix.close(timer_fd); // check err
 
         var event = EVENT{
@@ -332,15 +344,26 @@ pub const Context = struct {
 
         return null;
     }
-    pub fn wait(
+
+    //======================//
+    //COROUTINE
+    //
+    // pub fn run(self: *Context) !void {
+    // coroutine.start(self.eventLoop)
+    //
+    // }
+    pub inline fn eventLoop(
         self: *Self,
-        events: []linux.epoll_event,
-    ) !usize {
-        while (true) {
+        // comptime UserHandler: type ,
+        // handler: UserHandler,
+
+    ) !void {
+        var events: [64]EVENT = undefined;
+        while (!self.isCancelled()) {
             const count = linux.epoll_wait(
                 self.epfd,
-                events.ptr,
-                @intCast(events.len),
+                &events,
+                @intCast(64),
                 -1,
             );
             if (count < 0) {
@@ -358,28 +381,30 @@ pub const Context = struct {
                     _ = posix.read(self.cancelFd, &buf) catch {};
 
                     self.cancelled.store(true, .release);
+                    self.cancel();
                 } else if (fd == self.timerfd) {
                     var buf: [8]u8 = undefined;
                     _ = posix.read(self.timerfd.?, &buf) catch {};
 
+                    self.cancelled.store(true, .release);
                     self.cancel();
                 }
             }
 
-            return count;
+            return;
         }
     }
-
-    fn eventLoop(
-        self: *Self,
-    ) !void {
-        var events: [64]linux.epoll_event = undefined;
-
-        while (!self.isCancelled()) {
-            // eventLoop
-            _ = try self.wait(&events);
-        }
-    }
+    //
+    // pub fn eventLoop(
+    //     self: *Self,
+    // ) !void {
+    //     var events: [64]linux.epoll_event = undefined;
+    //
+    //     while (!self.isCancelled()) {
+    //         // eventLoop
+    //         _ = try self.wait(&events);
+    //     }
+    // }
 };
 test "context deadline with timerfd" {
     var db = std.heap.DebugAllocator(.{}){};
@@ -526,40 +551,14 @@ test "multi-level inheritance" {
     try std.testing.expectEqualStrings("root_value", child1_value);
     try std.testing.expectEqualStrings("root_value", child2_value);
 }
-test "cancel parent cancels child" {
-    const allocator = std.testing.allocator;
 
-    // Create parent context
-    var parent = try Context.init(allocator);
-    defer parent.deinit();
-
-    // Create child context
-    var child = try Context.withCancel(&parent);
+fn long_running_task(parent: *Context) !void {
+    var child = try Context.withCancel(parent);
     defer child.deinit();
 
-    // Spawn a thread to run child's eventLoop
-
-    runEventLoop(child); //if not thread its blocked
-    // i should think about this....
-
-    // Cancel the parent
-    parent.cancel();
-
-    // Give the child thread a moment to process the cancellation
-    std.time.sleep(100 * std.time.ns_per_ms);
-
-    // Verify that the child is canceled
-    try std.testing.expect(child.isCancelled());
-}
-
-inline fn runEventLoop(ctx: *Context) void {
-    try ctx.eventLoop();
-}
-
-fn long_running_task(ctx: *Context) !void {
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        if (ctx.isCancelled()) {
+        if (child.isCancelled()) {
             std.debug.print("Operation cancelled\n", .{});
             return;
         }
