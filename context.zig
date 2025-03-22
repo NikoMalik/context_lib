@@ -6,6 +6,14 @@ const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const time = std.time;
+const libcoro = @import("zigcoro");
+const xev = @import("xev");
+const aio = libcoro.asyncio;
+
+const xawait = libcoro.xawait;
+const xasync = libcoro.xasync;
+const xresume = libcoro.xresume;
+const xsuspend = libcoro.xsuspend;
 
 const epoll = switch (builtin.os.tag) {
     .linux => std.posix.fd_t,
@@ -23,57 +31,17 @@ pub const Second = 1000 * Millisecond;
 pub const Minute = 60 * Second;
 pub const Hour = 60 * Second;
 
-//pub const EPOLL = struct {
-//     pub const CLOEXEC = 1 << @bitOffsetOf(O, "CLOEXEC");
-//
-//     pub const CTL_ADD = 1;
-//     pub const CTL_DEL = 2;
-//     pub const CTL_MOD = 3;
-//
-//     pub const IN = 0x001;
-//     pub const PRI = 0x002;
-//     pub const OUT = 0x004;
-//     pub const RDNORM = 0x040;
-//     pub const RDBAND = 0x080;
-//     pub const WRNORM = if (is_mips) 0x004 else 0x100;
-//     pub const WRBAND = if (is_mips) 0x100 else 0x200;
-//     pub const MSG = 0x400;
-//     pub const ERR = 0x008;
-//     pub const HUP = 0x010;
-//     pub const RDHUP = 0x2000;
-//     pub const EXCLUSIVE = (@as(u32, 1) << 28);
-//     pub const WAKEUP = (@as(u32, 1) << 29);
-//     pub const ONESHOT = (@as(u32, 1) << 30);
-//     pub const ET = (@as(u32, 1) << 31);
-// };
-
-// pub const CLOCK = clockid_t;
-//
-// pub const clockid_t = enum(u32) {
-//     REALTIME = 0,
-//     MONOTONIC = 1,
-//     PROCESS_CPUTIME_ID = 2,
-//     THREAD_CPUTIME_ID = 3,
-//     MONOTONIC_RAW = 4,
-//     REALTIME_COARSE = 5,
-//     MONOTONIC_COARSE = 6,
-//     BOOTTIME = 7,
-//     REALTIME_ALARM = 8,
-//     BOOTTIME_ALARM = 9,
 //=============================================================//
 //TODO: PROTECT FROM RACE DATA,ADD MUTEXES[x],MAKE MOR FREANDLY API[], ASYNC WITH COROUTINE FROM CORO[]
 //=============================================================//
+//
+threadlocal var global_epoll: ?posix.fd_t = null;
+threadlocal var epoll_ref_count: Atomic(u32) = Atomic(u32).init(0);
 const Value = struct {
     ptr: *anyopaque, // where we store our value
     allocator: Allocator, // snap allocator that we can delete this shit
     freeFn: *const fn (Allocator, *anyopaque) void,
 };
-
-pub fn Block_fn(comptime T: type) type {
-    return struct {
-        run: *const fn () T,
-    };
-}
 
 pub const Context = struct {
     // CONTEXT 1 IS PARENT
@@ -81,8 +49,10 @@ pub const Context = struct {
     id: usize,
     allocator: Allocator,
     epfd: posix.fd_t,
+    Stack: libcoro.StackT,
+    frame: ?libcoro.FrameT(asyncEventLoop, .{ .ArgsT = std.meta.Tuple(&[_]type{*Self}) }) = null,
     cancelFd: posix.fd_t,
-    cancelled: Atomic(bool),
+    cancelled: Atomic(bool) = Atomic(bool).init(false),
     is_deinited: Atomic(bool) = Atomic(bool).init(false),
     timerfd: ?posix.fd_t,
     deadline: ?u64,
@@ -96,8 +66,17 @@ pub const Context = struct {
     pub fn init(
         allocator: Allocator,
     ) !Self {
-        const epfd = try posix.epoll_create1(0);
-        errdefer posix.close(epfd); // check err
+        if (global_epoll == null) {
+            global_epoll = try std.posix.epoll_create1(0);
+        }
+        _ = epoll_ref_count.fetchAdd(1, .release);
+        errdefer {
+            const count = epoll_ref_count.fetchSub(1, .release);
+            if (count == 1) {
+                posix.close(global_epoll.?);
+                global_epoll = null;
+            }
+        }
 
         const cancel_fd = try posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
 
@@ -110,15 +89,15 @@ pub const Context = struct {
                 .CLOEXEC = true,
             },
         );
-        errdefer posix.close(timer_fd); // check err
+        errdefer posix.close(@intCast(timer_fd)); // check err
 
         var event = EVENT{
             .events = linux.EPOLL.IN | linux.EPOLL.ET,
             .data = .{ .fd = cancel_fd },
         };
-        const err_ctl_1 = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, cancel_fd, &event);
+        const err_ctl_1 = linux.epoll_ctl(global_epoll.?, linux.EPOLL.CTL_ADD, cancel_fd, &event);
         if (err_ctl_1 == -1) {
-            posix.close(epfd);
+            posix.close(global_epoll);
             posix.close(cancel_fd);
             posix.close(timer_fd);
             std.log.err("Epoll Create Failed: {d}", .{err_ctl_1});
@@ -126,9 +105,9 @@ pub const Context = struct {
         }
 
         event.data.fd = @intCast(timer_fd);
-        const err_ctl_2_timer = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, @intCast(timer_fd), &event);
+        const err_ctl_2_timer = linux.epoll_ctl(global_epoll.?, linux.EPOLL.CTL_ADD, @intCast(timer_fd), &event);
         if (err_ctl_2_timer == -1) {
-            posix.close(epfd);
+            posix.close(global_epoll);
             posix.close(cancel_fd);
             posix.close(timer_fd);
 
@@ -136,17 +115,40 @@ pub const Context = struct {
             return error.EPOLL_CTL_ERROR_creation;
         }
 
+        const stack_size: usize = 1024 * 4;
+
+        const stack = try libcoro.stackAlloc(allocator, stack_size);
+        errdefer allocator.free(stack);
+
+        //
+        //         pub const EnvArg = struct {
+        //     executor: ?*Executor = null,
+        //     stack_allocator: ?std.mem.Allocator = null,
+        //     default_stack_size: ?usize = null,
+        // };
+        // threadlocal var env: Env = .{};
+        // pub fn initEnv(e: EnvArg) void {
+        //     env = .{ .exec = e.executor };
+        //     libcoro.initEnv(.{
+        //         .stack_allocator = e.stack_allocator,
+        //         .default_stack_size = e.default_stack_size,
+        //         .executor = if (e.executor) |ex| &ex.exec else null,
+        //     });
+        // }
+        //
+
         return Self{
             .id = 1,
             .allocator = allocator,
             .parent = null,
-            .epfd = epfd,
+            .Stack = stack,
+            .epfd = global_epoll.?,
             .cancelFd = cancel_fd,
             .timerfd = @intCast(timer_fd),
             .deadline = null,
-            .cancelled = Atomic(bool).init(false),
             .children = std.ArrayList(*Context).init(allocator),
             .values = std.StringHashMap(Value).init(allocator),
+            // .IO = io,
             // .values = std.StringHashMap(?*anyopaque).init(allocator),
         };
     }
@@ -172,6 +174,14 @@ pub const Context = struct {
         self.is_deinited.store(true, .release);
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.frame) |f| xawait(f);
+
+        const count = epoll_ref_count.fetchSub(1, .release);
+        if (count == 1) {
+            posix.close(global_epoll.?);
+            global_epoll = null;
+        }
+        self.cancel();
 
         //============================================//
         //how i get,keys automaticly clear after deinit
@@ -191,10 +201,13 @@ pub const Context = struct {
 
                     values.deinit();
                 }
+                // if (child.frame) |f| xawait(f);
                 child.deinit();
                 self.allocator.destroy(child);
             }
+            self.allocator.free(self.Stack);
             self.children.deinit();
+            // if (self.frame) |f| xawait(f);
 
             if (self.values) |*vals| {
                 var it = vals.iterator();
@@ -207,7 +220,8 @@ pub const Context = struct {
                 vals.deinit();
                 self.values = null;
             }
-            posix.close(self.epfd);
+            // self.IO.deinit(self.allocator);
+            // posix.close(self.epfd);
             posix.close(self.cancelFd);
             if (self.timerfd) |fd| posix.close(fd);
             std.debug.print("succeded clean: context{d}\n", .{self.id});
@@ -221,8 +235,9 @@ pub const Context = struct {
         //     self.values = null;
         // }
         // ================================//
-
-        posix.close(self.epfd);
+        // self.IO.deinit(self.allocator);
+        self.allocator.free(self.Stack);
+        // posix.close(self.epfd);
         posix.close(self.cancelFd);
         if (self.timerfd) |fd| posix.close(fd);
 
@@ -232,19 +247,42 @@ pub const Context = struct {
         self: *Self,
     ) void {
         if (!self.cancelled.swap(true, .seq_cst)) {
-            const val: u64 = 1;
-            _ = posix.write(self.cancelFd, std.mem.asBytes(&val)) catch {};
-            // if (self.parent == null) {
+            self.wakeUpEventLoop();
             for (self.children.items) |child| {
                 child.cancel();
             }
-            // }
-            // for (self.children.items) |child| {
-            //     child.cancel();
-            // }
         }
     }
+    inline fn wakeUpEventLoop(
+        self: *Self,
+    ) void {
+        const val: u64 = 1;
+        _ = posix.write(self.cancelFd, std.mem.asBytes(&val)) catch |err| {
+            std.log.err("Failed to write to cancelFd: {}\n", .{err});
+        };
+    }
+    fn handleCancel(
+        self: *Self,
+    ) void {
+        var buf: [8]u8 = undefined;
+        _ = posix.read(self.cancelFd, &buf) catch {};
 
+        self.cancelled.store(true, .release);
+
+        for (self.children.items) |child| {
+            child.handleCancel();
+        }
+    }
+    fn handleTimeout(self: *Self) void {
+        var buf: [8]u8 = undefined;
+        _ = posix.read(self.timerfd.?, &buf) catch {};
+
+        self.cancelled.store(true, .release);
+
+        for (self.children.items) |child| {
+            child.handleTimeout();
+        }
+    }
     pub inline fn isCancelled(
         self: *Self,
     ) bool {
@@ -267,7 +305,8 @@ pub const Context = struct {
             .it_value = ts,
         };
 
-        _ = linux.timerfd_settime(self.timerfd.?, linux.TFD.TIMER{}, &spec, null);
+        const ret = linux.timerfd_settime(self.timerfd.?, linux.TFD.TIMER{}, &spec, null);
+        if (ret == -1) return error.Set_TIMERFD;
         self.deadline = timeout_ns;
     }
     //DECLARE TYPE FOR VALUE
@@ -345,20 +384,22 @@ pub const Context = struct {
         return null;
     }
 
-    //======================//
-    //COROUTINE
-    //
-    // pub fn run(self: *Context) !void {
-    // coroutine.start(self.eventLoop)
-    //
-    // }
-    pub inline fn eventLoop(
+    pub fn eventLoop(
         self: *Self,
-        // comptime UserHandler: type ,
-        // handler: UserHandler,
-
     ) !void {
+        self.frame = try xasync(asyncEventLoop, .{self}, self.Stack);
+    }
+
+    pub fn wait(
+        self: *Self,
+    ) void {
+        if (self.frame) |frame| xawait(frame);
+    }
+    fn asyncEventLoop(
+        self: *Self,
+    ) void {
         var events: [64]EVENT = undefined;
+
         while (!self.isCancelled()) {
             const count = linux.epoll_wait(
                 self.epfd,
@@ -366,46 +407,21 @@ pub const Context = struct {
                 @intCast(64),
                 -1,
             );
-            if (count < 0) {
-                switch (posix.errno(count)) {
-                    .INTR => continue,
-                    else => |err| return posix.unexpectedErrno(err),
-                }
 
-                return error.EpollWaitFailed;
-            }
             for (events[0..count]) |*ev| {
                 const fd = ev.data.fd;
                 if (fd == self.cancelFd) {
-                    var buf: [8]u8 = undefined;
-                    _ = posix.read(self.cancelFd, &buf) catch {};
-
-                    self.cancelled.store(true, .release);
-                    self.cancel();
-                } else if (fd == self.timerfd) {
-                    var buf: [8]u8 = undefined;
-                    _ = posix.read(self.timerfd.?, &buf) catch {};
-
-                    self.cancelled.store(true, .release);
-                    self.cancel();
+                    self.handleCancel();
+                    break;
+                } else if (self.timerfd != null and fd == self.timerfd.?) {
+                    self.handleTimeout();
+                    break;
                 }
             }
-
-            return;
         }
     }
-    //
-    // pub fn eventLoop(
-    //     self: *Self,
-    // ) !void {
-    //     var events: [64]linux.epoll_event = undefined;
-    //
-    //     while (!self.isCancelled()) {
-    //         // eventLoop
-    //         _ = try self.wait(&events);
-    //     }
-    // }
 };
+
 test "context deadline with timerfd" {
     var db = std.heap.DebugAllocator(.{}){};
     defer _ = db.deinit();
@@ -427,6 +443,73 @@ test "context deadline with timerfd" {
     try std.testing.expect(ctx.isCancelled());
 }
 
+test "context cancellation 2" {
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init(allocator);
+    defer ctx.deinit();
+    try ctx.setDeadline(1 * Second);
+    try ctx.eventLoop();
+    try long_running_task(&ctx);
+    try std.testing.expect(ctx.isCancelled());
+}
+
+test "async cancellation with deadline" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    try ctx.setDeadline(100 * Millisecond);
+
+    try ctx.eventLoop();
+
+    const start_time = std.time.nanoTimestamp();
+
+    var i: u8 = 0;
+    while (i < 5) : (i += 1) {
+        std.time.sleep(20 * Millisecond);
+
+        if (ctx.isCancelled()) break;
+    }
+
+    const elapsed = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start_time)) / 1e6;
+    std.debug.print("Elapsed time: {d:.2}ms\n", .{elapsed});
+
+    try std.testing.expect(ctx.isCancelled());
+    try std.testing.expect(elapsed < 150);
+}
+
+test "parallel contexts" {
+    const allocator = std.testing.allocator;
+
+    var parent = try Context.init(allocator);
+    defer parent.deinit();
+
+    var child = try Context.withCancel(&parent);
+    defer child.deinit();
+
+    try parent.setDeadline(50 * Millisecond);
+
+    try child.setDeadline(100 * Millisecond);
+
+    // run coroutines
+    try parent.eventLoop();
+
+    try child.eventLoop();
+
+    // wait end
+    while (!parent.isCancelled() or !child.isCancelled()) {
+        std.time.sleep(1 * Millisecond);
+    }
+
+    try std.testing.expect(parent.isCancelled());
+    try std.testing.expect(child.isCancelled());
+}
+fn asyncCancel(ctx: *Context) void {
+    _ = ctx;
+    std.time.sleep(50 * Millisecond);
+}
+
 test "context cancellation" {
     var db = std.heap.DebugAllocator(.{}){};
     defer _ = db.deinit();
@@ -439,8 +522,8 @@ test "context cancellation" {
 
     try long_running_task(&ctx);
 
-    const thread = try std.Thread.spawn(.{}, long_running_task, .{&ctx});
-    defer thread.join();
+    // const thread = try std.Thread.spawn(.{}, long_running_task, .{&ctx});
+    // defer thread.join();
 
     // std.time.sleep(50 * std.time.ns_per_ms);
     // ctx.cancel();
@@ -552,7 +635,41 @@ test "multi-level inheritance" {
     try std.testing.expectEqualStrings("root_value", child2_value);
 }
 
+test "resource cleanup" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try Context.init(allocator);
+
+    ctx.deinit();
+    try std.testing.expect(global_epoll == null);
+}
+
+test "async cancel 2" {
+    const allocator = std.testing.allocator;
+    var parent = try Context.init(allocator);
+    defer parent.deinit();
+
+    try parent.eventLoop();
+    std.debug.print("Cancelled: {}\n", .{parent.isCancelled()});
+}
+
+test "async cancel" {
+    const allocator = std.testing.allocator;
+    var parent = try Context.init(allocator);
+    defer parent.deinit();
+
+    try parent.eventLoop();
+    std.debug.print("cancel :{any}\n", .{parent.isCancelled()});
+    asyncCancel(&parent);
+
+    std.debug.print("cancel :{any}\n", .{parent.isCancelled()});
+    try std.testing.expect(parent.isCancelled() == false);
+    parent.cancel();
+    return;
+}
+
 fn long_running_task(parent: *Context) !void {
+    std.debug.print("start running task from ctx: {d}\n", .{parent.id});
     var child = try Context.withCancel(parent);
     defer child.deinit();
 

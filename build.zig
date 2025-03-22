@@ -12,11 +12,18 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    const aio = b.dependency("zigcoro", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_mod.addImport("zigcoro", aio.module("libcoro"));
+
     const lib = b.addStaticLibrary(.{
         .name = "context.zig",
         .root_module = lib_mod,
         .link_libc = true,
     });
+    lib.root_module.addImport("zigcoro", aio.module("libcoro"));
 
     b.installArtifact(lib);
 
@@ -26,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    unit_tests_1.root_module.addImport("zigcoro", aio.module("libcoro"));
 
     unit_tests_1.linkLibrary(lib);
 

@@ -1,0 +1,23 @@
+.{
+    .name = .context_lib,
+    .version = "0.0.0",
+
+    .fingerprint = 0xc96b8cbf720df8e5, // Changing this has security and trust implications.
+
+    .minimum_zig_version = "0.14.0",
+
+    .dependencies = .{
+        .zigcoro = .{
+            .url = "https://github.com/NikoMalik/zigcoro/archive/refs/heads/main.tar.gz",
+            .hash = "zigcoro-0.0.0-_zKfQ5U_AQAg1zOuz6-U8jkBryOGOr52WO7WGhJQE1kU",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}
